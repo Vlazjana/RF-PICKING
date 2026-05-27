@@ -1,0 +1,632 @@
+*----------------------------------------------------------------------*
+***INCLUDE LZEWM_RF_PICKING_PM_01F12.
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*& Form fill_who_screen_for_print
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*&      --> RESOURCE
+*&      --> WHO
+*&      --> T_RF_PICK_HUS
+*&      <-- S_WHO_SCREEN
+*&---------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+
+FORM print_picking_label
+  USING    resource      TYPE /scwm/s_rsrc
+           who           TYPE /scwm/s_who_int
+           t_rf_pick_hus TYPE /scwm/tt_rf_pick_hus
+  CHANGING s_who_screen  TYPE zsrf_zpisys_who_screen.
+
+  CONSTANTS: lc_smartform TYPE tdsfname VALUE 'ZEWM_PICKING_LABEL'.
+
+  DATA: lv_fm_name     TYPE rs38l_fnam,
+        ls_ctrl_op     TYPE ssfctrlop,
+        ls_comp_op     TYPE ssfcompop,
+        ls_return      TYPE ssfcrescl,
+        lt_print_label TYPE TABLE OF zsrf_zpisys_who_screen,
+        lv_street      TYPE ad_street,
+        lv_post_code1  TYPE ad_pstcd1,
+        lv_city1       TYPE ad_city1,
+        lt_ordim_o     TYPE /scwm/tt_ordim_o,
+        ls_ordim_o     TYPE /scwm/ordim_o,
+        lo_delivery    TYPE REF TO /scwm/cl_dlv_management_prd,
+        lt_headers     TYPE /scwm/dlv_header_out_prd_tab,
+        ls_header      LIKE LINE OF lt_headers,
+        ls_address     TYPE bapibus1006_address,
+        ls_addr_sel    TYPE addr1_sel,
+        ls_addr_val    TYPE addr1_val.
+
+  IF gv_nr_etichette <= 0.
+    MESSAGE e046(zewm_rf_msg).
+    RETURN.
+  ENDIF.
+  IF gv_nr_etichette > 10.
+    MESSAGE e045(zewm_rf_msg).
+    RETURN.
+  ENDIF.
+
+  TRY.
+      CALL FUNCTION '/SCWM/WHO_GET'
+        EXPORTING
+          iv_lgnum   = resource-lgnum
+          iv_whoid   = who-who
+          iv_to      = abap_true
+        IMPORTING
+          et_ordim_o = lt_ordim_o.
+    CATCH /scwm/cx_core.
+  ENDTRY.
+
+  READ TABLE lt_ordim_o INTO ls_ordim_o INDEX 1.
+  DATA(lv_dloc) = ls_ordim_o-nlpla.
+
+  READ TABLE t_rf_pick_hus ASSIGNING FIELD-SYMBOL(<ls_pick_hu>) INDEX 1.
+  IF sy-subrc <> 0 OR <ls_pick_hu>-huident IS INITIAL.
+    MESSAGE e034(zewm_rf_msg).
+    RETURN.
+  ENDIF.
+
+  DATA(lv_huident) = <ls_pick_hu>-huident.
+  SHIFT lv_huident LEFT DELETING LEADING '0'.
+
+  IF s_who_screen-pdo IS NOT INITIAL.
+    lo_delivery = NEW /scwm/cl_dlv_management_prd( ).
+    TRY.
+        lo_delivery->query(
+          EXPORTING
+            iv_doccat       = /scdl/if_dl_c=>sc_doccat_out_prd
+            it_selection    = VALUE /scwm/dlv_selection_tab(
+              ( fieldname = /scdl/if_dl_logfname_c=>sc_docno_h
+                sign      = wmegc_sign_inclusive
+                option    = wmegc_option_eq
+                low       = |{ s_who_screen-pdo ALPHA = IN }| ) )
+            is_read_options = VALUE #(
+              data_retrival_only      = abap_true
+              mix_in_object_instances =
+                /scwm/if_dl_c=>sc_mix_in_load_instance )
+            is_include_data = VALUE #(
+              head_partyloc = abap_true )    " include party/address data
+          IMPORTING
+            et_headers = lt_headers ).
+
+        READ TABLE lt_headers INTO ls_header INDEX 1.
+
+      CATCH /scdl/cx_delivery.
+    ENDTRY.
+  ENDIF.
+
+
+  " PATH 1 — get ADDRESSID from delivery PARTYLOC (role STPRT)
+  READ TABLE ls_header-partyloc
+    INTO DATA(ls_partyloc)
+    WITH KEY party_role = 'STPRT'.
+
+  IF sy-subrc = 0 AND ls_partyloc-addressid IS NOT INITIAL.
+    ls_addr_sel-addrnumber = ls_partyloc-addressid.
+
+    CALL FUNCTION 'ADDR_GET'
+      EXPORTING
+        address_selection = ls_addr_sel
+      IMPORTING
+        address_value     = ls_addr_val
+      EXCEPTIONS
+        parameter_error   = 1
+        address_not_exist = 2
+        version_not_exist = 3
+        internal_error    = 4
+        address_blocked   = 5
+        OTHERS            = 6.
+
+    IF sy-subrc = 0.
+      lv_street     = ls_addr_val-street.
+      lv_post_code1 = ls_addr_val-post_code1.
+      lv_city1      = ls_addr_val-city1.
+    ENDIF.
+  ENDIF.
+
+  " PATH 2 — fallback to standard BUPA partner address
+  IF lv_city1 IS INITIAL AND s_who_screen-partyno IS NOT INITIAL.
+    CALL FUNCTION 'BUPA_ADDRESS_GET_DETAIL'
+      EXPORTING
+        iv_partner = s_who_screen-partyno
+      IMPORTING
+        es_address = ls_address
+      EXCEPTIONS
+        OTHERS     = 1.
+
+    IF sy-subrc = 0.
+      lv_street     = ls_address-street.
+      lv_post_code1 = ls_address-postl_cod1.
+      lv_city1      = ls_address-city.
+    ENDIF.
+  ENDIF.
+
+  IF s_who_screen-partyno IS NOT INITIAL.
+    SELECT SINGLE title_let
+      FROM but000
+      WHERE partner = @s_who_screen-partyno
+      INTO @DATA(lv_title_let).
+  ENDIF.
+
+  DATA(lv_outb_del) = s_who_screen-pdo.
+  SHIFT lv_outb_del LEFT DELETING LEADING '0'.
+
+  s_who_screen-huident      = lv_huident.
+  s_who_screen-pdo          = lv_outb_del.
+  s_who_screen-lgnum        = resource-lgnum.
+  s_who_screen-rsrc         = sy-uname.
+  s_who_screen-z_dats       = sy-datum.
+  s_who_screen-nlpla        = lv_dloc.
+  s_who_screen-zb_colli_tot = |{ s_who_screen-zv_colli_prel DECIMALS = 0 }|.
+  s_who_screen-street       = lv_street.
+  s_who_screen-post_code1   = lv_post_code1.
+  s_who_screen-city1        = lv_city1.
+  s_who_screen-title_let    = lv_title_let.
+  s_who_screen-who          = who-who.
+
+  CALL FUNCTION 'SSF_FUNCTION_MODULE_NAME'
+    EXPORTING
+      formname           = lc_smartform
+    IMPORTING
+      fm_name            = lv_fm_name
+    EXCEPTIONS
+      no_form            = 1
+      no_function_module = 2
+      OTHERS             = 3.
+
+  IF sy-subrc <> 0.
+    MESSAGE e035(zewm_rf_msg).
+    RETURN.
+  ENDIF.
+
+  CLEAR gt_certificazione.
+
+  DO gv_nr_etichette TIMES.
+
+    IF gv_nr_etichette = 1.
+      s_who_screen-zv_barcode = lv_huident.
+    ELSE.
+      s_who_screen-zv_barcode = lv_huident &&
+        |{ sy-index WIDTH = 2 ALIGN = RIGHT PAD = '0' }|.
+    ENDIF.
+
+    s_who_screen-zv_labelnr = |{ sy-index }| && '/' &&
+                              |{ gv_nr_etichette }|.
+
+    CLEAR lt_print_label.
+    APPEND s_who_screen TO lt_print_label.
+
+    " --- Print control settings ---
+    ls_ctrl_op-no_dialog = abap_true.
+    ls_ctrl_op-preview   = abap_true.
+
+    ls_comp_op-tdprinter = 'PDFPRINTER'.
+    ls_comp_op-tddest    = 'ZPDF'.
+    ls_comp_op-tdcopies  = 1.
+    ls_comp_op-tdimmed   = abap_true.   " Immediate print — no spool hold
+    ls_comp_op-tddelete  = abap_false.  " Keep spool entry after print
+    ls_comp_op-tdfinal   = abap_true.   " Close print job
+
+    CALL FUNCTION lv_fm_name
+      EXPORTING
+        control_parameters = ls_ctrl_op
+        output_options     = ls_comp_op
+        user_settings      = abap_false
+      IMPORTING
+        job_output_info    = ls_return
+      TABLES
+        it_zrf_picking     = lt_print_label
+      EXCEPTIONS
+        formatting_error   = 1
+        internal_error     = 2
+        send_error         = 3
+        user_canceled      = 4
+        OTHERS             = 5.
+
+    CASE sy-subrc.
+      WHEN 0.
+        APPEND VALUE ztewm_certificaz(
+          lgnum      = resource-lgnum
+          zzportal   = s_who_screen-nlpla
+          zzlabel    = s_who_screen-zv_barcode
+          who        = who-who
+          docno      = s_who_screen-pdo
+          partyno    = s_who_screen-partyno
+          zzcertstat = space
+        ) TO gt_certificazione.
+      WHEN 1. MESSAGE e036(zewm_rf_msg).
+      WHEN 2. MESSAGE e037(zewm_rf_msg).
+      WHEN 3. MESSAGE e038(zewm_rf_msg).
+      WHEN 4. MESSAGE e039(zewm_rf_msg).
+      WHEN OTHERS. MESSAGE e040(zewm_rf_msg).
+    ENDCASE.
+
+  ENDDO.
+
+  "====================================================================
+  " SECTION 10: Save All Certificate Records in One MODIFY
+  "====================================================================
+  IF gt_certificazione IS NOT INITIAL.
+    MODIFY ztewm_certificaz FROM TABLE gt_certificazione.
+    IF sy-subrc = 0.
+      COMMIT WORK AND WAIT.
+    ELSE.
+      ROLLBACK WORK.
+      MESSAGE e047(zewm_rf_msg).
+    ENDIF.
+  ENDIF.
+
+  "====================================================================
+  " SECTION 11: Reset Global Screen Table
+  "====================================================================
+  CLEAR gt_who_screen.
+  DO 3 TIMES.
+    APPEND INITIAL LINE TO gt_who_screen.
+  ENDDO.
+
+ENDFORM.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+*
+*
+*
+***INCLUDE LZEWM_RF_PICKING_PM_01F10.
+**----------------------------------------------------------------------*
+*FORM print_picking_label
+*  USING    resource    TYPE /scwm/s_rsrc
+*           who         TYPE /scwm/s_who_int
+*           t_rf_pick_hus    TYPE /scwm/tt_rf_pick_hus
+*  CHANGING s_who_screen  TYPE zsrf_zpisys_who_screen.
+*
+*  CONSTANTS: lc_smartform TYPE tdsfname VALUE 'ZEWM_PICKING_LABEL'.
+*
+*  DATA : lv_fm_name TYPE rs38l_fnam,
+*         lv_printer TYPE rspopname,
+*         ls_ctrl_op TYPE ssfctrlop,
+*         ls_comp_op TYPE ssfcompop,
+*         ls_return  TYPE ssfcrescl,
+*         lv_msg     TYPE string.
+*  DATA : lt_print_label TYPE TABLE OF zsrf_zpisys_who_screen.
+*
+*  DATA: lv_barcode TYPE /scwm/de_huident.
+*  DATA: lv_street     TYPE ad_street,
+*        lv_post_code1 TYPE ad_pstcd1,
+*        lv_city1      TYPE ad_city1.
+*
+*  IF gv_nr_etichette <= 0.
+*    MESSAGE e046(zewm_rf_msg).
+*    RETURN.
+*  ENDIF.
+*  IF gv_nr_etichette > 10.
+*    MESSAGE e045(zewm_rf_msg).
+*    RETURN.
+*  ENDIF.
+*
+*  " Get DLOC from confirmed tasks
+*  SELECT SINGLE nlpla
+*    FROM /scwm/ordim_o
+*    WHERE lgnum = @resource-lgnum
+*      AND who   = @who-who
+*    INTO @DATA(lv_dloc).
+*
+*  READ TABLE t_rf_pick_hus ASSIGNING FIELD-SYMBOL(<ls_pick_hu>) INDEX 1.
+*  IF sy-subrc <> 0 OR <ls_pick_hu>-huident IS INITIAL.
+*    MESSAGE e034(zewm_rf_msg).
+*    RETURN.
+*  ENDIF.
+*
+*  DATA(lv_huident) = <ls_pick_hu>-huident.
+*  SHIFT lv_huident LEFT DELETING LEADING '0'.
+*
+*  IF s_who_screen-pdo IS NOT INITIAL.
+*    SELECT SINGLE docid
+*      FROM /scdl/db_proch_o
+*      WHERE docno = @( |{ s_who_screen-pdo ALPHA = IN }| )
+*      INTO @DATA(lv_docid).
+*  ENDIF.
+*
+*  IF lv_docid IS NOT INITIAL.
+*    SELECT SINGLE addressid
+*      FROM /scdl/db_bploc
+*      WHERE docid      = @lv_docid
+*        AND party_role = 'STPRT'
+*      INTO @DATA(lv_addressid).
+*  ENDIF.
+*
+*  IF lv_addressid IS NOT INITIAL.
+*    SELECT SINGLE street, post_code1, city1
+*      FROM adrc
+*      WHERE addrnumber = @lv_addressid
+*      INTO (@lv_street, @lv_post_code1, @lv_city1).
+*  ELSE.
+*    IF s_who_screen-partyno IS NOT INITIAL.
+*      SELECT SINGLE adrc~street, adrc~post_code1, adrc~city1
+*        FROM but020
+*        INNER JOIN adrc ON adrc~addrnumber = but020~addrnumber
+*        WHERE but020~partner = @s_who_screen-partyno
+*        INTO (@lv_street, @lv_post_code1, @lv_city1).
+*    ENDIF.
+*  ENDIF.
+*
+*  IF s_who_screen-partyno IS NOT INITIAL.
+*    SELECT SINGLE title_let
+*      FROM but000
+*      WHERE partner = @s_who_screen-partyno
+*      INTO @DATA(lv_title_let).
+*  ENDIF.
+*
+*  DATA(lv_outb_del) = s_who_screen-pdo.
+*  SHIFT lv_outb_del LEFT DELETING LEADING '0'.
+*
+*  s_who_screen-huident = lv_huident.
+*  s_who_screen-pdo = lv_outb_del.
+*  s_who_screen-lgnum =  resource-lgnum.
+*  s_who_screen-rsrc =  sy-uname.
+*  s_who_screen-z_dats = sy-datum.
+*  s_who_screen-nlpla  = lv_dloc.
+*  s_who_screen-zb_colli_tot = |{ s_who_screen-zv_colli_prel DECIMALS = 0 }|.
+*  s_who_screen-street     = lv_street.
+*  s_who_screen-post_code1 = lv_post_code1.
+*  s_who_screen-city1      = lv_city1.
+*  s_who_screen-title_let  = lv_title_let.
+*  s_who_screen-who  = who-who.
+*
+** Stampa etichetta
+** Stampa Smartform*******************************************************************************
+*  CALL FUNCTION 'SSF_FUNCTION_MODULE_NAME'
+*    EXPORTING
+*      formname           = lc_smartform
+*    IMPORTING
+*      fm_name            = lv_fm_name
+*    EXCEPTIONS
+*      no_form            = 1
+*      no_function_module = 2
+*      OTHERS             = 3.
+*
+*  IF sy-subrc <> 0.
+*    MESSAGE e035(zewm_rf_msg).
+*  ENDIF.
+*
+*  CLEAR gt_certificazione.
+*  DO gv_nr_etichette TIMES.
+*
+*    IF gv_nr_etichette = 1.
+*      s_who_screen-zv_barcode = lv_huident.
+*    ELSE.
+*      s_who_screen-zv_barcode = lv_huident &&
+*|{ sy-index WIDTH = 2 ALIGN = RIGHT PAD = '0' }|.
+*    ENDIF.
+*
+*    s_who_screen-zv_labelnr = |{ sy-index }| && '/' && |{ gv_nr_etichette }|.
+*    CLEAR lt_print_label.
+*    APPEND s_who_screen TO lt_print_label.
+**
+*    ls_ctrl_op-no_dialog   = abap_true.
+**        ls_ctrl_op-preview     = abap_false.
+*    ls_ctrl_op-preview     = abap_true.
+*    ls_comp_op-tdprinter   = 'PDFPRINTER'.
+*    ls_comp_op-tddest      = 'ZPDF'.
+*    ls_comp_op-tdcopies    = 1.
+*    ls_comp_op-tdimmed     = abap_true.   " stampa immediata (non trattiene in spool)
+**  ls_comp_op-tddelete    = abap_true.   " cancella spool dopo stampa
+*    ls_comp_op-tddelete    = abap_false.   " non cancella spool dopo stampa
+*    ls_comp_op-tdfinal     = abap_true.   " chiude il job di stampa
+*
+*    CALL FUNCTION lv_fm_name
+*      EXPORTING
+*        control_parameters = ls_ctrl_op
+*        output_options     = ls_comp_op
+*        user_settings      = abap_false     "non usare impostazioni utente?
+*      IMPORTING
+*        job_output_info    = ls_return
+*      TABLES
+*        it_zrf_picking     = lt_print_label
+*      EXCEPTIONS
+*        formatting_error   = 1
+*        internal_error     = 2
+*        send_error         = 3
+*        user_canceled      = 4
+*        OTHERS             = 5.
+*
+*    CASE sy-subrc.
+*      WHEN 0.
+*
+*        APPEND VALUE ztewm_certificaz(
+*          lgnum      = resource-lgnum
+*          zzportal   = s_who_screen-nlpla
+*          zzlabel    = s_who_screen-zv_barcode
+*          who        = who-who
+*          docno      = s_who_screen-pdo
+*          partyno    = s_who_screen-partyno
+*          zzcertstat = space
+*        ) TO gt_certificazione.
+*
+*      WHEN 1.
+*        MESSAGE e036(zewm_rf_msg).
+*      WHEN 2.
+*        MESSAGE e037(zewm_rf_msg).
+*      WHEN 3.
+*        MESSAGE e038(zewm_rf_msg).
+*      WHEN 4.
+*        MESSAGE e039(zewm_rf_msg).
+*      WHEN OTHERS.
+*        MESSAGE e040(zewm_rf_msg).
+*    ENDCASE.
+*  ENDDO.
+*
+*  " *** Save ALL labels at once AFTER the loop ***
+*  IF gt_certificazione IS NOT INITIAL.
+*    MODIFY ztewm_certificaz FROM TABLE gt_certificazione.
+*    IF sy-subrc = 0.
+*      COMMIT WORK AND WAIT.
+*    ELSE.
+*      ROLLBACK WORK.
+*      MESSAGE e047(zewm_rf_msg).
+*    ENDIF.
+*  ENDIF.
+*
+*  CLEAR gt_who_screen.
+*  DO 3 TIMES.
+*    APPEND INITIAL LINE TO gt_who_screen.
+*  ENDDO.
+*ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form handle_zpick4_init
+**&---------------------------------------------------------------------*
+FORM handle_zpick4_init
+  USING    is_resource   TYPE /scwm/s_rsrc
+           is_who        TYPE /scwm/s_who_int
+  CHANGING cs_who_screen TYPE zsrf_zpisys_who_screen
+           cs_ordim      TYPE /scwm/s_rf_ordim_confirm
+           ct_pick_hus   TYPE /scwm/tt_rf_pick_hus.
+
+  IF cs_who_screen-recover_flag IS NOT INITIAL.
+
+    SELECT SUM( nista )
+      FROM /scwm/ordim_c
+      WHERE lgnum = @is_who-lgnum
+        AND who   = @is_who-who
+      INTO @cs_who_screen-zv_colli_prel.
+
+    SELECT SUM( vsola )
+      FROM /scwm/ordim_c
+      WHERE lgnum = @is_who-lgnum
+        AND who   = @is_who-who
+      INTO @cs_who_screen-zv_colli_tot.
+
+    WRITE cs_who_screen-zv_colli_prel TO gv_colli_prel_int NO-GROUPING DECIMALS 0.
+    WRITE cs_who_screen-zv_colli_tot  TO gv_colli_totali_int NO-GROUPING DECIMALS 0.
+    CONDENSE gv_colli_prel_int   NO-GAPS.
+    CONDENSE gv_colli_totali_int NO-GAPS.
+
+    DATA: ls_ctx_rec   TYPE zss_ewm_rf_recov_ctx,
+          lv_found_rec TYPE abap_bool.
+
+    PERFORM load_recov_ctx
+     USING    is_resource-lgnum
+           is_resource-rsrc
+           is_who-who
+     CHANGING ls_ctx_rec lv_found_rec.
+
+    IF lv_found_rec = abap_true.
+      cs_ordim-lgnum          = ls_ctx_rec-s_who_screen-lgnum.
+      cs_ordim-who            = ls_ctx_rec-who-who.
+      cs_who_screen-pdo       = ls_ctx_rec-s_who_screen-pdo.
+      cs_who_screen-partyno   = ls_ctx_rec-s_who_screen-partyno.
+      cs_who_screen-name_org1 = ls_ctx_rec-s_who_screen-name_org1.
+
+      CLEAR ct_pick_hus.
+
+      IF ls_ctx_rec-huident IS NOT INITIAL.
+        APPEND VALUE /scwm/s_rf_pick_hus(
+          pmat          = ls_ctx_rec-pmat
+          pmat_guid     = ls_ctx_rec-pmat_guid
+          huident       = ls_ctx_rec-huident
+          huident_verif = ls_ctx_rec-huident_verif
+          logpos        = ls_ctx_rec-logpos
+          dstgrp        = ls_ctx_rec-dstgrp
+          pointer       = ls_ctx_rec-pointer
+          hukng         = ls_ctx_rec-hukng
+        ) TO ct_pick_hus.
+      ENDIF.
+
+      /scwm/cl_rf_bll_srvc=>init_screen_param( ).
+      /scwm/cl_rf_bll_srvc=>set_screen_param( 'ORDIM_CONFIRM' ).
+      /scwm/cl_rf_bll_srvc=>set_screen_param( 'S_WHO_SCREEN' ).
+      /scwm/cl_rf_bll_srvc=>set_screen_param( 'TT_ORDIM_CONFIRM' ).
+      /scwm/cl_rf_bll_srvc=>set_screen_param( '/SCWM/TT_RF_PICK_HUS' ).
+      /scwm/cl_rf_bll_srvc=>set_scr_tabname(
+        iv_scr_tabname = '/SCWM/TT_RF_PICK_HUS' ).
+    ENDIF.
+
+  ELSE.
+
+    /scwm/cl_rf_bll_srvc=>set_screen_param( 'ORDIM_CONFIRM' ).
+    /scwm/cl_rf_bll_srvc=>set_screen_param( 'S_WHO_SCREEN' ).
+    /scwm/cl_rf_bll_srvc=>set_screen_param( 'TT_ORDIM_CONFIRM' ).
+    /scwm/cl_rf_bll_srvc=>set_screen_param( '/SCWM/TT_RF_PICK_HUS' ).
+    /scwm/cl_rf_bll_srvc=>set_screen_param( 'S_WHO_SCREEN' ).
+
+    SELECT SUM( nista ) AS sum_nista,
+           SUM( vsola ) AS sum_vsola
+      FROM /scwm/ordim_c
+      WHERE lgnum = @is_who-lgnum
+        AND who   = @is_who-who
+      INTO @DATA(ls_sum).
+
+    cs_who_screen-zv_colli_prel = ls_sum-sum_nista.
+    cs_who_screen-zv_colli_tot  = ls_sum-sum_vsola.
+    WRITE cs_who_screen-zv_colli_prel TO gv_colli_prel_int NO-GROUPING DECIMALS 0.
+    WRITE cs_who_screen-zv_colli_tot  TO gv_colli_totali_int NO-GROUPING DECIMALS 0.
+    CONDENSE gv_colli_prel_int   NO-GAPS.
+    CONDENSE gv_colli_totali_int NO-GAPS.
+
+    DATA: ls_ctx_norm   TYPE zss_ewm_rf_recov_ctx,
+          lv_found_norm TYPE abap_bool.
+
+    PERFORM load_recov_ctx
+    USING    is_resource-lgnum
+             is_resource-rsrc
+             is_who-who
+    CHANGING ls_ctx_norm lv_found_norm.
+
+    IF lv_found_norm = abap_true.
+      MOVE-CORRESPONDING cs_who_screen TO ls_ctx_norm-s_who_screen.
+      READ TABLE ct_pick_hus INTO DATA(ls_hu_rec) INDEX 1.
+      IF sy-subrc = 0.
+        ls_ctx_norm-pmat          = ls_hu_rec-pmat.
+        ls_ctx_norm-pmat_guid     = ls_hu_rec-pmat_guid.
+        ls_ctx_norm-huident       = ls_hu_rec-huident.
+        ls_ctx_norm-huident_verif = ls_hu_rec-huident_verif.
+        ls_ctx_norm-logpos        = ls_hu_rec-logpos.
+        ls_ctx_norm-dstgrp        = ls_hu_rec-dstgrp.
+        ls_ctx_norm-pointer       = ls_hu_rec-pointer.
+        ls_ctx_norm-hukng         = ls_hu_rec-hukng.
+      ENDIF.
+
+      ls_ctx_norm-recover_scr = step_pick4.
+      PERFORM save_recov_ctx_partial
+      USING    is_resource-lgnum
+               is_resource-rsrc
+               is_who-who
+      CHANGING ls_ctx_norm.
+    ENDIF.
+
+    IF cs_who_screen-zv_colli_prel = 0.
+
+      PERFORM delete_recov_ctx
+      USING is_resource-lgnum
+            is_resource-rsrc
+            is_who-who.
+
+      COMMIT WORK AND WAIT.
+      /scwm/cl_rf_bll_srvc=>set_prmod( /scwm/cl_rf_bll_srvc=>c_prmod_background ).
+      /scwm/cl_rf_bll_srvc=>set_fcode( /scwm/cl_rf_bll_srvc=>c_fcode_leave ).
+      RETURN.
+    ENDIF.
+
+    COMMIT WORK AND WAIT.
+    /scwm/cl_rf_bll_srvc=>set_prmod( /scwm/cl_rf_bll_srvc=>c_prmod_foreground ).
+
+  ENDIF.
+
+ENDFORM.

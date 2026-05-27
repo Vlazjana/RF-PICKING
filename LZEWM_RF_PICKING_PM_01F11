@@ -1,0 +1,720 @@
+*----------------------------------------------------------------------*
+***INCLUDE LZEWM_RF_PICKING_PM_01F11.
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*& Form enter_processing
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*&      <-- RESOURCE
+*&      <-- WHO
+*&      <-- T_RF_PICK_HUS
+*&      <-- S_WHO_SCREEN
+*&      <-- ORDIM_CONFIRM
+*&      <-- TT_ORDIM_CONFIRM
+*&      <-- TT_NESTED_HU
+*&      <-- NESTED_HU
+*&      <-- SELECTION
+*&      <-- LV_RESTART_TRANSACTION
+*&      <-- WME_VERIF
+*&---------------------------------------------------------------------*
+FORM enter_processing
+  CHANGING cs_resource      TYPE /scwm/s_rsrc
+           cs_who           TYPE /scwm/s_who_int
+           ct_rf_pick_hus   TYPE /scwm/tt_rf_pick_hus
+           cs_who_screen    TYPE zsrf_zpisys_who_screen
+           cs_ordim_confirm TYPE /scwm/s_rf_ordim_confirm
+           ct_ordim_confirm TYPE /scwm/tt_rf_ordim_confirm
+           ct_nested_hu     TYPE /scwm/tt_rf_nested_hu
+           cs_nested_hu     TYPE /scwm/s_rf_nested_hu
+           cs_selection     TYPE /scwm/s_rf_selection
+           cv_restart       TYPE abap_bool
+           cs_wme_verif     TYPE /scwm/s_wme_verif.
+
+  DATA: lv_zzing_outb    TYPE zzingoutb,
+        lv_docid         TYPE /scdl/dl_docid,
+        lv_zzing_factor  TYPE zzingoutb,
+        lv_docno         TYPE /scdl/dl_docno,
+        lv_pack_declared TYPE zzingoutb,
+        lv_zzing_single  TYPE zzingoutb,
+        lv_labels        TYPE i.
+
+  DATA(lv_pending) = abap_false.
+
+  LOOP AT gt_scan ASSIGNING FIELD-SYMBOL(<row>).
+
+    IF <row>-zzcertstat = 'X'.
+      CONTINUE.
+    ENDIF.
+
+    IF <row>-zzlabel_scan IS INITIAL.
+      lv_pending = abap_true.
+      CONTINUE.
+    ENDIF.
+
+    IF <row>-zzlabel_scan <> <row>-zzlabel.
+      MESSAGE e000(zewm_rf_msg) WITH <row>-zzlabel.
+      CLEAR <row>-zzlabel_scan.
+      RETURN.
+    ENDIF.
+
+    <row>-zzcertstat = 'X'.
+    CLEAR <row>-zzlabel_scan.
+
+    DATA: ls_ctx_f11   TYPE zss_ewm_rf_recov_ctx,
+          lv_found_f11 TYPE abap_bool.
+
+    PERFORM load_recov_ctx
+      USING    cs_resource-lgnum
+               cs_resource-rsrc
+               cs_who-who
+      CHANGING ls_ctx_f11
+               lv_found_f11.
+
+    IF lv_found_f11 = abap_true.
+      READ TABLE ls_ctx_f11-tt_rcvscan
+        ASSIGNING FIELD-SYMBOL(<ls_scan_f11>)
+        WITH KEY zzlabel = <row>-zzlabel.
+      IF sy-subrc = 0.
+        <ls_scan_f11>-zzcertstat = 'X'.
+      ENDIF.
+
+      PERFORM save_recov_ctx_partial
+        USING    cs_resource-lgnum
+                 cs_resource-rsrc
+                 cs_who-who
+        CHANGING ls_ctx_f11.
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_pending = abap_true.
+    /scwm/cl_rf_bll_srvc=>set_prmod( /scwm/cl_rf_bll_srvc=>c_prmod_foreground ).
+    RETURN.
+  ENDIF.
+  " 2) If all confirmed - enable destination (NLPLA).
+  "    On second ENTER (gv_all_confirmed = 'X') the final logic.
+  IF gt_scan IS NOT INITIAL AND
+     NOT line_exists( gt_scan[ zzcertstat = ' ' ] ).
+
+    /scwm/cl_rf_bll_srvc=>set_screlm_input_on( gc_scr_elmnt_nlpla_vrf ).
+
+    IF gv_all_confirmed = 'X'.
+
+      IF cs_who_screen-nlpla_verif IS INITIAL.
+        MESSAGE e001(zewm_rf_msg).
+        /scwm/cl_rf_bll_srvc=>set_prmod( /scwm/cl_rf_bll_srvc=>c_prmod_foreground ).
+        RETURN.
+      ENDIF.
+
+      IF cs_who_screen-nlpla_verif <> cs_ordim_confirm-nlpla.
+        MESSAGE e002(zewm_rf_msg) WITH cs_ordim_confirm-nlpla.
+        CLEAR cs_who_screen-nlpla_verif.
+        RETURN.
+      ENDIF.
+
+   " Get labels count and calculate total packaging declared
+      lv_labels = gv_nr_etichette.
+      CLEAR lv_pack_declared.
+
+      LOOP AT gt_who_screen ASSIGNING FIELD-SYMBOL(<ls_sum>).
+        CHECK <ls_sum>-nr_packaging IS NOT INITIAL.
+        lv_pack_declared += <ls_sum>-nr_packaging.
+      ENDLOOP.
+
+    "Calculate ZZING_OUTB per spec scenarios
+      CLEAR lv_zzing_outb.
+
+    " Exception: loose single items (volantini) - packaging = 0
+      IF lv_pack_declared = 0.
+         lv_zzing_outb = 0.
+
+    "Scenario 2: labels <> packaging declared
+      ELSEIF lv_labels <> lv_pack_declared.
+             lv_zzing_outb = lv_labels.
+
+   " Scenario 1: labels = packaging declared
+      ELSE.
+        LOOP AT gt_who_screen ASSIGNING FIELD-SYMBOL(<ls_p>).
+          CHECK <ls_p>-matnr IS NOT INITIAL AND <ls_p>-nr_packaging > 0.
+
+          CLEAR lv_zzing_single.
+          SELECT SINGLE zzing
+            FROM ztewm_mat_imb
+            WHERE matnr = @<ls_p>-matnr
+            INTO @lv_zzing_single.
+
+          IF sy-subrc = 0.
+            lv_zzing_outb += <ls_p>-nr_packaging * lv_zzing_single.
+          ELSE.
+            " Fallback: material not in table - use labels count
+            lv_zzing_outb = lv_labels.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+      DATA(lv_tablin) = /scwm/cl_rf_bll_srvc=>get_line( ).
+      IF lv_tablin = 0.
+        lv_tablin = 1.
+      ENDIF.
+
+      READ TABLE ct_ordim_confirm INTO cs_ordim_confirm INDEX lv_tablin.
+
+      cs_ordim_confirm-nlpla_verif = cs_who_screen-nlpla_VERIF.
+
+      MODIFY ct_ordim_confirm FROM cs_ordim_confirm INDEX lv_tablin.
+
+      " Run PBO to populate all required fields
+      CALL FUNCTION 'Z_EWM_RF_PICK_PIPLHU_PBO_01'
+        CHANGING
+          resource         = cs_resource
+          ordim_confirm    = cs_ordim_confirm
+          tt_ordim_confirm = ct_ordim_confirm
+          wme_verif        = cs_wme_verif.
+
+      " Update table with populated ordim_confirm
+      lv_tablin = /scwm/cl_rf_bll_srvc=>get_line( ).
+      IF lv_tablin = 0. lv_tablin = 1. ENDIF.
+
+      " Set NLPLA_VERIF from your screen
+      READ TABLE ct_ordim_confirm INTO cs_ordim_confirm INDEX lv_tablin.
+      cs_ordim_confirm-nlpla_verif = cs_ordim_confirm-nlpla.
+      cs_ordim_confirm-pickhu_verif = cs_ordim_confirm-pickhu.
+      MODIFY ct_ordim_confirm FROM cs_ordim_confirm INDEX lv_tablin.
+
+
+      CALL FUNCTION 'Z_EWM_RF_PICK_PIPLHU_PAI_01'
+        CHANGING
+          selection        = cs_selection
+          resource         = cs_resource
+          who              = cs_who
+          ordim_confirm    = cs_ordim_confirm
+          nested_hu        = cS_nested_hu
+          tt_ordim_confirm = ct_ordim_confirm
+          tt_nested_hu     = ct_nested_hu
+          t_rf_pick_hus    = ct_rf_pick_hus
+          wme_verif        = cs_wme_verif.
+
+
+      SELECT SINGLE 'X'
+        FROM /scwm/ordim_c
+        WHERE lgnum = @cs_resource-lgnum
+          AND who   = @cs_who-who
+        INTO @DATA(lv_who_confirmed).
+
+      IF lv_who_confirmed IS NOT INITIAL.
+
+        PERFORM add_pckg_itm_to_pdo
+          USING    cs_resource-lgnum
+                   cs_who-who
+                   lv_zzing_outb
+          CHANGING lv_docid
+                   lv_docno.
+
+        IF lv_docno IS NOT INITIAL AND lv_pack_declared > 0.
+          SELECT SINGLE docid, zzing_outb
+            FROM /scdl/db_proch_o
+            WHERE docno = @lv_docno
+            INTO @DATA(ls_proch_o).
+
+          IF sy-subrc = 0.
+            DATA lv_zzing_total TYPE zzingoutb.
+            lv_zzing_total = ls_proch_o-zzing_outb + lv_zzing_outb.
+
+            UPDATE /scdl/db_proch_o
+              SET zzing_outb = @lv_zzing_total
+              WHERE docid    = @ls_proch_o-docid.
+          ENDIF.
+        ENDIF.
+        CLEAR: gv_all_confirmed, gt_scan, gv_nr_etichette.
+
+         PERFORM delete_recov_ctx
+          USING cs_resource-lgnum
+                cs_resource-rsrc
+                cs_who-who.
+        COMMIT WORK AND WAIT.
+      ELSE.
+        MESSAGE e048(zewm_rf_msg) WITH cs_who-who.
+      ENDIF.
+      RETURN.
+
+    ELSE.
+
+      gv_all_confirmed = 'X'.
+      DATA: ls_ctx_ac   TYPE zss_ewm_rf_recov_ctx,
+            lv_found_ac TYPE abap_bool.
+
+        PERFORM load_recov_ctx
+        USING    cs_resource-lgnum
+                 cs_resource-rsrc
+                 cs_who-who
+        CHANGING ls_ctx_ac lv_found_ac.
+
+      IF lv_found_ac = abap_true.
+        ls_ctx_ac-all_confirmed = 'X'.
+          PERFORM save_recov_ctx_partial
+          USING    cs_resource-lgnum
+                   cs_resource-rsrc
+                   cs_who-who
+          CHANGING ls_ctx_ac.
+      ENDIF.
+      COMMIT WORK.
+
+      /scwm/cl_rf_bll_srvc=>set_prmod( /scwm/cl_rf_bll_srvc=>c_prmod_foreground ).
+      /scwm/cl_rf_bll_srvc=>set_fcode( 'ENTER' ).  "stay on same screen
+    ENDIF.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form add_pckg_itm_to_pdo
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*&      --> CS_RESOURCE_LGNUM
+*&      --> CS_WHO_WHO
+*&      --> LV_ZZING_OUTB
+*&      <-- LV_DOCID
+*&      <-- LV_DOCNO
+*&---------------------------------------------------------------------*
+FORM add_pckg_itm_to_pdo    USING iv_lgnum TYPE /scwm/lgnum
+             iv_who        TYPE /scwm/de_who
+             iv_zzing_outb TYPE zzingoutb
+    CHANGING ev_docid      TYPE /scdl/dl_docid
+             ev_docno      TYPE /scdl/dl_docno..
+
+
+  DATA: lo_sp_prd_out        TYPE REF TO /scdl/cl_sp_prd_OUT,
+        lo_message_box       TYPE REF TO /scdl/cl_sp_message_box,
+        lv_docid             TYPE /scdl/dl_docid,
+        lv_docno             TYPE /scdl/dl_docno,
+        lv_rejected          TYPE abap_bool,
+        lt_return_codes      TYPE /scdl/t_sp_return_code,
+        lv_item_created      TYPE abap_bool,
+
+        " For locking
+        ls_inkey             TYPE /scdl/s_sp_k_head,
+        lt_inkey             TYPE /scdl/t_sp_k_head,
+
+        " For INSERT item
+        ls_item              TYPE /scdl/s_sp_a_item,
+        lt_item              TYPE /scdl/t_sp_a_item,
+        lt_item_out          TYPE /scdl/t_sp_a_item,
+
+        " Relation key
+        ls_relation_inkey    TYPE /scdl/s_sp_k_head,
+
+        " For Product aspect
+        ls_item_product      TYPE /scdl/s_sp_a_item_product,
+        lt_item_product      TYPE /scdl/t_sp_a_item_product,
+        lt_item_product_out  TYPE /scdl/t_sp_a_item_product,
+
+        " For Quantity aspect
+        ls_item_quantity     TYPE /scdl/s_sp_a_item_quantity,
+        lt_item_quantity     TYPE /scdl/t_sp_a_item_quantity,
+        lt_item_quantity_out TYPE /scdl/t_sp_a_item_quantity,
+
+        " Item number
+        lv_itemno            TYPE /scdl/dl_itemno,
+        lv_new_itemid        TYPE /scdl/dl_itemid.
+
+  " Get DOCID from WHO
+  SELECT SINGLE proc~docid, proc~docno
+    FROM /scwm/ordim_c AS wt
+    INNER JOIN /scdl/db_proch_o AS proc
+      ON proc~docid = wt~rdocid
+    WHERE wt~lgnum = @iv_lgnum
+      AND wt~who   = @iv_who
+    INTO (@lv_docid, @lv_docno).
+
+  IF sy-subrc <> 0 OR lv_docid IS INITIAL.
+    MESSAGE e003(zewm_rf_msg).
+    RETURN.
+  ENDIF.
+  ev_docno = lv_docno.
+  "Check if there are packaging items to add
+  CLEAR lv_item_created.
+
+  LOOP AT gt_who_screen ASSIGNING FIELD-SYMBOL(<ls_check>).
+    IF <ls_check>-matnr IS NOT INITIAL AND <ls_check>-nr_packaging > 0.
+      lv_item_created = abap_true.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_item_created = abap_false AND iv_zzing_outb = 0.
+    RETURN.
+  ENDIF.
+
+  " message box and SP instance
+  CREATE OBJECT lo_message_box.
+
+  TRY.
+      CREATE OBJECT lo_sp_prd_out
+        EXPORTING
+          io_message_box = lo_message_box
+          iv_doccat      = /scdl/if_dl_doc_c=>sc_doccat_out_prd
+          iv_mode        = /scdl/cl_sp=>sc_mode_classic.
+
+    CATCH cx_root INTO DATA(lx_create).
+      MESSAGE e006(zewm_rf_msg) WITH lx_create->get_text( ).
+      RETURN.
+  ENDTRY.
+
+*" Load delivery into memory
+  DATA: lt_docno    TYPE /scdl/dl_sel_docno_tab,
+        ls_docno    TYPE /scdl/dl_sel_docno_str,
+        lt_head_out TYPE /scdl/t_sp_a_head.
+
+  ls_docno-docno = lv_docno.
+  ls_docno-doccat = /scdl/if_dl_doc_c=>sc_doccat_out_prd.
+  APPEND ls_docno TO lt_docno.
+
+  lo_sp_prd_out->/scdl/if_sp_query_id~query_docno(
+    EXPORTING
+      it_docno     = lt_docno
+    IMPORTING
+      et_outrecords = lt_head_out
+      ev_rejected   = lv_rejected ).
+
+  IF lv_rejected = abap_true.
+    ROLLBACK WORK.
+    /scwm/cl_tm=>cleanup( ).
+    MESSAGE e005(zewm_rf_msg) WITH lv_docno.
+    RETURN.
+  ENDIF.
+
+  ls_inkey-docid = lv_docid.
+  APPEND ls_inkey TO lt_inkey.
+
+  TRY.
+      lo_sp_prd_out->/scdl/if_sp1_locking~lock(
+        EXPORTING
+          inkeys   = lt_inkey
+          aspect   = /scdl/if_sp_c=>sc_asp_head
+          lockmode = /scdl/if_sp1_locking=>sc_exclusive_lock
+        IMPORTING
+          rejected     = lv_rejected
+          return_codes = lt_return_codes ).
+
+      IF lv_rejected = abap_true.
+        ROLLBACK WORK.
+        /scwm/cl_tm=>cleanup( ).
+        MESSAGE e004(zewm_rf_msg).
+        RETURN.
+      ENDIF.
+
+    CATCH cx_root INTO DATA(lx_lock).
+      ROLLBACK WORK.
+      /scwm/cl_tm=>cleanup( ).
+      MESSAGE e007(zewm_rf_msg) WITH lx_lock->get_text( ).
+      RETURN.
+  ENDTRY.
+
+  ls_relation_inkey-docid = lv_docid.
+  DATA ls_relation_outrecord  TYPE /scdl/s_sp_a_head.
+
+  LOOP AT gt_who_screen ASSIGNING FIELD-SYMBOL(<ls_pack>) WHERE matnr IS NOT INITIAL
+        AND nr_packaging > 0 .
+
+    IF <ls_pack>-matnr IS INITIAL OR <ls_pack>-nr_packaging <= 0.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR: ls_item, lt_item, lt_item_out.
+
+    ls_item-itemcat  = 'PAC'.
+    ls_item-docid    = lv_docid.
+    ls_item-itemtype = 'ZPAC'.
+    ls_item-manual   = abap_true.
+
+    APPEND ls_item TO lt_item.
+
+    TRY.
+        lo_sp_prd_out->/scdl/if_sp1_aspect~insert(
+          EXPORTING
+            aspect         = /scdl/if_sp_c=>sc_asp_item
+            inrecords      = lt_item
+            relation_inkey = ls_relation_inkey
+          IMPORTING
+            outrecords     = lt_item_out
+            relation_outrecord = ls_relation_outrecord
+            rejected       = lv_rejected
+            return_codes   = lt_return_codes ).
+
+        IF lv_rejected = abap_true.
+          CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+          /scwm/cl_tm=>cleanup( ).
+          MESSAGE e008(zewm_rf_msg) WITH <ls_pack>-matnr.
+          RETURN.
+        ENDIF.
+
+      CATCH cx_root INTO DATA(lx_stock).
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        /scwm/cl_tm=>cleanup( ).
+        MESSAGE e009(zewm_rf_msg) WITH lx_stock->get_text( ).
+        RETURN.
+    ENDTRY.
+
+    " Get new item ID
+    READ TABLE lt_item_out INTO DATA(ls_new_item) INDEX 1.
+    IF sy-subrc <> 0 OR ls_new_item-itemid IS INITIAL.
+      ROLLBACK WORK.
+      /scwm/cl_tm=>cleanup( ).
+      MESSAGE e010(zewm_rf_msg) WITH <ls_pack>-matnr.
+      RETURN.
+    ENDIF.
+
+    lv_new_itemid = ls_new_item-itemid.
+
+    "UPDATE Product - using /SCDL/S_SP_A_ITEM_PRODUCT
+    CLEAR: ls_item_product, lt_item_product, lt_item_product_out.
+
+    ls_item_product-docid     = lv_docid.
+    ls_item_product-itemid    = lv_new_itemid.
+    ls_item_product-productno = <ls_pack>-matnr.
+
+    APPEND ls_item_product TO lt_item_product.
+
+    TRY.
+        lo_sp_prd_out->/scdl/if_sp1_aspect~update(
+          EXPORTING
+            aspect       = /scdl/if_sp_c=>sc_asp_item_product
+            inrecords    = lt_item_product
+          IMPORTING
+            outrecords   = lt_item_product_out
+            rejected     = lv_rejected
+
+            return_codes = lt_return_codes ).
+
+        IF lv_rejected = abap_true.
+          CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+          /scwm/cl_tm=>cleanup( ).
+          MESSAGE e011(zewm_rf_msg) WITH <ls_pack>-matnr.
+          RETURN.
+        ENDIF.
+
+      CATCH cx_root INTO lx_stock.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        /scwm/cl_tm=>cleanup( ).
+        MESSAGE e012(zewm_rf_msg) WITH lx_stock->get_text( ).
+        RETURN.
+    ENDTRY.
+
+
+    " UPDATE Quantity - using /SCDL/S_SP_A_ITEM_QUANTITY
+    CLEAR: ls_item_quantity, lt_item_quantity, lt_item_quantity_out.
+
+    ls_item_quantity-docid  = lv_docid.
+    ls_item_quantity-itemid = lv_new_itemid.
+    ls_item_quantity-qty    = <ls_pack>-nr_packaging.
+    ls_item_quantity-uom    = 'ST'.
+
+    APPEND ls_item_quantity TO lt_item_quantity.
+
+    TRY.
+        lo_sp_prd_out->/scdl/if_sp1_aspect~update(
+          EXPORTING
+            aspect       = /scdl/if_sp_c=>sc_asp_item_quantity
+            inrecords    = lt_item_quantity
+          IMPORTING
+            outrecords   = lt_item_quantity_out
+            rejected     = lv_rejected
+            return_codes = lt_return_codes ).
+
+
+        IF lv_rejected = abap_true.
+          CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+          /scwm/cl_tm=>cleanup( ).
+          MESSAGE e013(zewm_rf_msg) WITH <ls_pack>-matnr.
+          RETURN.
+        ENDIF.
+
+      CATCH cx_root INTO lx_stock.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        /scwm/cl_tm=>cleanup( ).
+        MESSAGE e014(zewm_rf_msg) WITH lx_stock->get_text( ).
+        RETURN.
+    ENDTRY.
+
+    DATA: ls_item_stock     TYPE /scdl/s_sp_a_item_stock,
+          lt_item_stock     TYPE /scdl/t_sp_a_item_stock,
+          lt_item_stock_out TYPE /scdl/t_sp_a_item_stock.
+
+    CLEAR: ls_item_stock, lt_item_stock, lt_item_stock_out.
+
+    ls_item_stock-docid          = lv_docid.
+    ls_item_stock-itemid         = lv_new_itemid.
+    ls_item_stock-stock_category = 'F3'.
+
+    APPEND ls_item_stock TO lt_item_stock.
+
+    TRY.
+        lo_sp_prd_out->/scdl/if_sp1_aspect~update(
+          EXPORTING
+            aspect       = /scdl/if_sp_c=>sc_asp_item_stock
+            inrecords    = lt_item_stock
+          IMPORTING
+            outrecords   = lt_item_stock_out
+            rejected     = lv_rejected
+            return_codes = lt_return_codes ).
+
+        IF lv_rejected = abap_true.
+          CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+          /scwm/cl_tm=>cleanup( ).
+          MESSAGE e015(zewm_rf_msg) WITH <ls_pack>-matnr.
+          RETURN.
+        ENDIF.
+
+      CATCH cx_root INTO lx_stock.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        /scwm/cl_tm=>cleanup( ).
+        MESSAGE e016(zewm_rf_msg) WITH lx_stock->get_text( ).
+        RETURN.
+    ENDTRY.
+  ENDLOOP.
+
+  TRY.
+      lo_sp_prd_out->/scdl/if_sp1_transaction~before_save(
+        IMPORTING
+          rejected = lv_rejected ).
+
+      IF lv_rejected = abap_true.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        /scwm/cl_tm=>cleanup( ).
+        MESSAGE e017(zewm_rf_msg).
+        RETURN.
+      ENDIF.
+
+    CATCH cx_root INTO DATA(lx_before).
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      /scwm/cl_tm=>cleanup( ).
+      MESSAGE e018(zewm_rf_msg) WITH lx_before->get_text( ).
+      RETURN.
+  ENDTRY.
+
+  TRY.
+      lo_sp_prd_out->/scdl/if_sp1_transaction~save(
+        IMPORTING
+          rejected = lv_rejected ).
+
+      IF lv_rejected = abap_true.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        /scwm/cl_tm=>cleanup( ).
+        MESSAGE e019(zewm_rf_msg).
+        RETURN.
+      ENDIF.
+
+    CATCH cx_root INTO DATA(lx_save).
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      /scwm/cl_tm=>cleanup( ).
+      MESSAGE e020(zewm_rf_msg) WITH lx_save->get_text( ).
+      RETURN.
+  ENDTRY.
+
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+    EXPORTING
+      wait = abap_true.
+
+  /scwm/cl_tm=>cleanup( ).
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form print_processing
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*& -->  p1        text
+*& <--  p2        text
+*&---------------------------------------------------------------------*
+FORM print_processing .
+  LOOP AT gt_scan ASSIGNING FIELD-SYMBOL(<ls_scan>).
+    CLEAR <ls_scan>-zzcheckbox.
+  ENDLOOP.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form print_labels
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*&      --> ZT_CERTIF_SCAN
+*&      --> LC_SMARTFORM
+*&---------------------------------------------------------------------*
+FORM print_labels  USING pt_rows    TYPE ztrf_certif_scan.
+
+
+  CONSTANTS: lc_smartform TYPE tdsfname VALUE 'ZEWM_PICKING_LABEL'.
+
+  DATA: lv_fm_name     TYPE rs38l_fnam,
+        ls_ctrl_op     TYPE ssfctrlop,
+        ls_comp_op     TYPE ssfcompop,
+        ls_return      TYPE ssfcrescl,
+        lt_print_label TYPE TABLE OF zsrf_zpisys_who_screen.
+
+  CALL FUNCTION 'SSF_FUNCTION_MODULE_NAME'
+    EXPORTING
+      formname           = lc_smartform
+    IMPORTING
+      fm_name            = lv_fm_name
+    EXCEPTIONS
+      no_form            = 1
+      no_function_module = 2
+      OTHERS             = 3.
+
+  IF sy-subrc <> 0.
+    MESSAGE e035(zewm_rf_msg).
+    RETURN.
+  ENDIF.
+
+  DATA(lv_total) = lines( pt_rows ).
+  DATA(lv_idx)   = 0.
+
+  LOOP AT pt_rows INTO DATA(ls_row).
+    lv_idx = lv_idx + 1.
+
+    gs_who_screen-zv_barcode = ls_row-zzlabel.
+    gs_who_screen-zv_labelnr = |{ lv_idx }| && '/' && |{ lv_total }|.
+
+    CLEAR lt_print_label.
+    APPEND gs_who_screen TO lt_print_label.
+
+    ls_ctrl_op-no_dialog = abap_true.
+    ls_ctrl_op-preview   = abap_true.
+    ls_comp_op-tdprinter = 'PDFPRINTER'.
+    ls_comp_op-tddest    = 'ZPDF'.
+    ls_comp_op-tdcopies  = 1.
+    ls_comp_op-tdimmed   = abap_true.
+    ls_comp_op-tddelete  = abap_false.
+    ls_comp_op-tdfinal   = abap_true.
+
+    CALL FUNCTION lv_fm_name
+      EXPORTING
+        control_parameters = ls_ctrl_op
+        output_options     = ls_comp_op
+        user_settings      = abap_false
+      IMPORTING
+        job_output_info    = ls_return
+      TABLES
+        it_zrf_picking     = lt_print_label
+      EXCEPTIONS
+        formatting_error   = 1
+        internal_error     = 2
+        send_error         = 3
+        user_canceled      = 4
+        OTHERS             = 5.
+
+    CASE sy-subrc.
+      WHEN 0.
+      WHEN 1.
+        MESSAGE e036(zewm_rf_msg).
+      WHEN 2.
+        MESSAGE e037(zewm_rf_msg).
+      WHEN 3.
+        MESSAGE e038(zewm_rf_msg).
+      WHEN 4.
+        MESSAGE e039(zewm_rf_msg).
+      WHEN OTHERS.
+        MESSAGE e040(zewm_rf_msg).
+    ENDCASE.
+
+  ENDLOOP.
+ENDFORM.
